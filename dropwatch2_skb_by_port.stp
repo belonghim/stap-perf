@@ -1,0 +1,75 @@
+#!/bin/env -S stap -g --all-modules -v
+# dropwatch2_skb_by_port.stp
+# Usage: stap -g  dropwatch2_skb_by_port.stp <port> -o  dropwatch2_skb_by_port.out
+# v1.0
+%{
+#include <linux/version.h>
+#include <net/sock.h>
+#include <net/tcp.h>
+#include <net/ip.h>
+#include <linux/skbuff.h>
+%}
+
+function __tcp_skb_seq:long (tcphdr:long)
+{
+    return @cast(tcphdr, "tcphdr", "kernel<linux/tcp.h>")->seq
+}
+
+function get_ip_src:long (skb_param:long) %{
+  struct iphdr *iph;
+  long saddr;
+  iph=ip_hdr((struct sk_buff*)STAP_ARG_skb_param);
+  saddr =(long)iph->saddr;
+  STAP_RETURN(saddr);
+%}
+
+function get_ip_dst:long (skb_param:long) %{
+  struct iphdr *iph;
+  long daddr;
+  iph=ip_hdr((struct sk_buff*)STAP_ARG_skb_param);
+  daddr =(long)iph->daddr;
+  STAP_RETURN(daddr);
+%}
+
+function get_ip_protocol:long (skb_param:long) %{
+  struct iphdr *iph;
+  long protocol;
+  iph=ip_hdr((struct sk_buff*)STAP_ARG_skb_param);
+  protocol=(long)iph->protocol;
+  STAP_RETURN(protocol);
+%}
+
+global targetPort
+
+probe begin {
+    targetPort = strtol (@1, 10)
+    printf ("Filtering on port %d\n", targetPort)
+    printf ("Probing started...\n")
+    }
+
+probe kernel.function("kfree_skb")
+{
+    if ($skb)
+    {
+    protocol = get_ip_protocol($skb)
+        if (protocol == 6)
+        {
+        tcphdr = __get_skb_tcphdr($skb);
+        dport = 0;
+            if (tcphdr != 0)
+                {
+                dport = __tcp_skb_dport(tcphdr);
+                sport = __tcp_skb_sport(tcphdr);
+                ack = __tcp_skb_ack(tcphdr)
+                seq = __tcp_skb_seq(tcphdr)
+            }
+            if (dport == targetPort || sport == targetPort) {
+                printf ("%s (%lu) PID:%d processname:%s %s args [%s] srcIP=%s dstIP=%s sport=%d dport=%d"
+                    " socket=%x protocol=%d ack=%d seq=%d\n", ctime(gettimeofday_s()), gettimeofday_ns(), pid(), 
+                    execname(), probefunc(), $$parms, ip_ntop(get_ip_src($skb)), ip_ntop(get_ip_dst($skb)), 
+                    sport, dport, $skb->sk, get_ip_protocol($skb), ack, seq);
+                print_backtrace()
+            }
+        }
+    }
+}

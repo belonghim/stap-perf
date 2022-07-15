@@ -1,0 +1,139 @@
+#!/usr/bin/stap -g
+# Usage : stap -g tcp-reset.stp
+# Monitor generation of TCP Resets
+#
+# Example: TCP Reset into non-listen socket
+#
+# Day Mmm DD HH:MM:SS YYYY (+111111111 ns) swapper/1(0) tcp_v4_send_reset saddr=172.16.1.7 sport=9001 daddr=172.16.1.8 dport=51310
+# Day Mmm DD HH:MM:SS YYYY (+111111111 ns) swapper/1(0) tcp_v6_send_reset saddr=fe80:0000:0000:0000:5054:00ff:fe00:0701 sport=9001 daddr=fe80:0000:0000:0000:5054:00ff:fe00:0801 dport=52770
+#
+# Example: Process closed with data remaining in read buffer
+#
+# Day Mmm DD HH:MM:SS YYYY (+111111111 ns) nc(12345) tcp_send_active_reset saddr=172.16.1.7 sport=9001 daddr=172.16.1.8 dport=51314
+# Day Mmm DD HH:MM:SS YYYY (+111111111 ns) nc(12345) tcp_send_active_reset saddr=fe80:0000:0000:0000:5054:00ff:fe00:0701 sport=9001 daddr=fe80:0000:0000:0000:5054:00ff:fe00:0801 dport=52774
+#
+# Example: Socket closing with SO_LINGER set to zero
+#
+# Day Mmm DD HH:MM:SS YYYY (+111111111 ns) python3(1234) tcp_send_active_reset saddr=127.0.0.1 sport=9001 daddr=127.0.0.1 dport=43976
+# Day Mmm DD HH:MM:SS YYYY (+111111111 ns) python3(1234) tcp_send_active_reset saddr=0000:0000:0000:0000:0000:0000:0000:0001 sport=9001 daddr=0000:0000:0000:0000:0000:0000:0000:0001 dport=59358
+
+global AF_INET = 2;
+global AF_INET6 = 10;
+
+%{
+#include <linux/version.h>
+#include <net/sock.h>
+#include <net/tcp.h>
+#include <net/ip.h>
+#include <linux/skbuff.h>
+#include <linux/types.h>
+#include <linux/in6.h>
+%}
+
+function get_iph_version:long (iphdr:long)
+%{ /* pure */
+    // same bitset trick as '_is_reset' in tcpmip tapset
+    struct iphdr *iph = (struct iphdr *)(long) STAP_ARG_iphdr;
+    struct iphdr iph_copy;
+    memset (((void*)&iph_copy), 0, sizeof(iph_copy));
+    kderef_buffer(((void *)&iph_copy), iph, sizeof(struct iphdr));
+    STAP_RETVALUE = iph_copy.version;
+    CATCH_DEREF_FAULT();
+%}
+
+probe begin { printf ("Reset monitoring started...\n"); }
+probe end { printf("Reset monitoring stopped.\n"); }
+
+// kernel.function("tcp_send_active_reset").call $sk:struct sock* $priority:gfp_t
+probe kernel.function("tcp_send_active_reset").call
+{
+    now = gettimeofday_ns();
+
+    // we should always have an active sk here. does both v4 and v6.
+    try {
+        family = __ip_sock_family($sk);
+        saddr = format_ipaddr(__ip_sock_saddr($sk), family);
+        daddr = format_ipaddr(__ip_sock_daddr($sk), family);
+        sport = __tcp_sock_sport($sk);
+        dport = __tcp_sock_dport($sk);
+    } catch { };
+
+    printf ("%s (+%9d ns) %s(%d) %s saddr=%s sport=%d daddr=%s dport=%d\n",
+            ctime(now / 1000000000), (now % 1000000000), execname(), pid(), ppfunc(),
+            saddr, sport, daddr, dport);
+    print_backtrace();
+}
+
+// kernel.function("tcp_v4_send_reset").call $sk:struct sock* $skb:struct sk_buff*
+// kernel.function("tcp_v6_send_reset").call $sk:struct sock* $skb:struct sk_buff*
+probe kernel.function("tcp_v4_send_reset").call,
+      kernel.function("tcp_v6_send_reset").call
+{
+    now = gettimeofday_ns();
+
+    // initialise with obviously wrong values
+    saddr = "unknown";
+    daddr = "unknown";
+    sport = 99999;
+    dport = 99999;
+
+    // we do not always have an active sk, such as SYN into non-listening port.
+    // if there is no sk, this will fill the addrs but not ports
+    try {
+        family = __ip_sock_family($sk);
+        saddr = format_ipaddr(__ip_sock_saddr($sk), family);
+        daddr = format_ipaddr(__ip_sock_daddr($sk), family);
+        sport = __tcp_sock_sport($sk);
+        dport = __tcp_sock_dport($sk);
+    } catch { };
+
+    // if we have failed getting a port, try the skb instead. we're looking at
+    // the skb we're sending, so reverse src/dst logic for printing
+    if ((sport == 99999) && ($skb != 0)) {
+        try {
+            iphdr = __get_skb_iphdr($skb);
+            version = get_iph_version(iphdr);
+        } catch { };
+        if (version == 4) {
+            try {
+                saddr = format_ipaddr(__ip_skb_daddr(iphdr), AF_INET);
+                daddr = format_ipaddr(__ip_skb_saddr(iphdr), AF_INET);
+            } catch { };
+        } else if (version == 6) {
+            try {
+                iphdr = __get_skb_iphdr(@choose_defined($skb, kernel_pointer($pskb)))
+                saddr = format_ipaddr(&@cast(iphdr, "ipv6hdr", "kernel<linux/ipv6.h>")->daddr, AF_INET6);
+                daddr = format_ipaddr(&@cast(iphdr, "ipv6hdr", "kernel<linux/ipv6.h>")->saddr, AF_INET6);
+            } catch { };
+        }
+        // there used to be a check for (skb proto == 6) here. but we're in
+        // tcp code so that must be right, and there is no such field in
+        // 'struct ipv6hdr' anyway, so just do it
+        try {
+            tcphdr = __get_skb_tcphdr(@choose_defined($skb, kernel_pointer($pskb)));
+            sport = __tcp_skb_dport(tcphdr);
+            dport = __tcp_skb_sport(tcphdr);
+        } catch { };
+    }
+
+    printf ("%s (+%9d ns) %s(%d) %s saddr=%s sport=%d daddr=%s dport=%d\n",
+            ctime(now / 1000000000), (now % 1000000000), execname(), pid(), ppfunc(),
+            saddr, sport, daddr, dport);
+    print_backtrace();
+}
+
+// we probe the entire module because there is no one function to probe
+// EL5: reject() with static send_reset() potentially inlined
+// EL6: reject_tg() with static send_reset() potentially inlined
+// EL7: reject_tg() with nf_send_reset() elsewhere
+// EL8: reject_tg() with nf_send_reset() elsewhere
+// however, the overall reason is iptables, so packet details are not needed
+// here. debug the firewall (eg: with -j LOG) if further info is desired.
+probe module("ipt_REJECT").function("*").call,
+      module("ip6t_REJECT").function("*").call
+{
+    now = gettimeofday_ns();
+    printf ("%s (+%9d ns) %s(%d) %s\n",
+            ctime(now / 1000000000), (now % 1000000000), execname(), pid(), ppfunc());
+    //print_backtrace();
+}
